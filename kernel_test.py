@@ -50,8 +50,8 @@ if SPARSIFY:
             choices = N_CHOICES[rstr[j // SPARSE_BLOCK_SIZE]]
             sparse[i, j+choices] = 0.0
 
-W = ((b_Wq * scales[:, None]) + zeros[:, None]).T
-hiW = ((b_Wq.to(torch.float32) * scales[:, None].to(torch.float32)) + zeros[:, None].to(torch.float32)).T
+W = ((b_Wq - zeros[:, None]) * scales[:, None]).T
+hiW = ((b_Wq.to(torch.float32) - zeros[:, None].to(torch.float32)) * scales[:, None].to(torch.float32)).T
 
 def fast_pack():
     f_Wq = torch.empty((SIZE//16, HIDE_DIM), dtype=torch.int, device="cuda:0")

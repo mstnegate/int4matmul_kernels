@@ -21,20 +21,6 @@ using namespace nvcuda;
 ////////////////////////////////////////////////////////////////////////////////
 
 template <typename scalar_t>
-__device__ inline scalar_t _fma(const scalar_t a, const scalar_t b, const scalar_t c) {
-    return a*b + c;
-}
-template<>
-__device__ inline float _fma<float>(const float a, const float b, const float c) {
-    return __fmaf_rn(a, b, c);
-}
-template<>
-__device__ inline __half _fma<__half>(const __half a, const __half b, const __half c) {
-    return __hfma(a, b, c);
-}
-
-// TODO: i wonder if half arithmetic "just works"
-template <typename scalar_t>
 __device__ inline scalar_t _mult(const scalar_t a, const scalar_t b) {
     return a*b;
 }
@@ -184,7 +170,9 @@ __device__ void MMA_Int4_Float<false>(
 
                 #pragma unroll
                 for (size_t ii = 0; ii < 8; ++ii) {
-                    accum += multiplier_chunk[mtik + ii] * (scale * _cast_out(a & MSK) + zero);
+                    accum += multiplier_chunk[mtik + ii] * (
+                        scale * (_cast_out(a & MSK) - zero)
+                    );
                     a >>= 4;
                 }
             }
@@ -231,7 +219,7 @@ __device__ void load_in<false>(
     const size_t src_i,
     const size_t src_j,
     const __half scale,
-    const __half zero
+    __half zero
 ) {
     const __half HALF_ZERO = __float2half(0.0f);
 
@@ -241,7 +229,7 @@ __device__ void load_in<false>(
         uint32_t v = src[src_j + read_stride * (src_i + read_i)];
         #pragma unroll
         for(size_t ii = 0; ii < 8; ++ii) {
-            dest[ii*32] = _fma(scale, __float2half((float)(v & MSK)), zero);
+            dest[ii*32] = __hmul(scale, __hsub(__float2half((float)(v & MSK)), zero));
             v >>= 4;
         }
     } else {
@@ -306,7 +294,7 @@ __device__ void load_in<true>(
         #pragma unroll
         for(size_t ii = 0; ii < 4; ++ii) {
             dest[coord_buf[seek + (ii*32)] * 32] =
-                _fma(scale, __float2half((float)(v & MSK)), zero);
+                __hmul(scale, __hsub(__float2half((float)(v & MSK)), zero));
             v >>= 4;
         }
     } else {
