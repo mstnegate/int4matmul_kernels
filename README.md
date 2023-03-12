@@ -10,7 +10,7 @@ kernel_test.py is included for basic speed and accuracy testing. It also shows h
 
 ## Benchmarks
 
-Below are some unscientific generation speed benchmarks on "real-world" inferencing. All models were run with a RTX 3080 10G, in KoboldAI. INT4 and INT4+16:32 models were quantized/sparsified via (reduced-kobold)[https://github.com/mstnegate/reduced-kobold/]
+Below are some unscientific generation speed benchmarks on "real-world" inferencing. All models were run with a RTX 3080 10G, in KoboldAI. INT4 and INT4+16:32 models were quantized/sparsified via [reduced-kobold](https://github.com/mstnegate/reduced-kobold/)
 
 All tests are the median of 7 runs, using identical sampler settings and generating 80 tokens with max context (2048, or I guess more technically 1968 tokens.) Execution time was measured from the front-end.
 
