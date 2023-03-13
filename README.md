@@ -10,20 +10,26 @@ kernel_test.py is included for basic speed and accuracy testing. It also shows h
 
 ## Benchmarks
 
-Below are some unscientific generation speed benchmarks on "real-world" inferencing. All models were run with a RTX 3080 10G, in KoboldAI. INT4 and INT4+16:32 models were quantized/sparsified via [reduced-kobold](https://github.com/mstnegate/reduced-kobold/)
+Below are some unscientific generation speed benchmarks on "real-world" inferencing. All models were run with a RTX 3080 10G. INT4 and INT4+16:32 models were quantized/sparsified via [reduced-kobold](https://github.com/mstnegate/reduced-kobold/). 
 
-All tests are the median of 7 runs, using identical sampler settings and generating 80 tokens with max context (2048, or I guess more technically 1968 tokens.) Execution time was measured from the front-end.
+All tests below use the same sampler settings and generated 80 tokens with max context (2048, or I guess technically 1968 of context going in.) Reported numbers are the median of 7 runs.
 
-| Bits | Sparsity |  125M |  2.7B |   13B  |
-|------| -------- | ----- | ----- | ------ |
-|  16  |   100%   | 2.30s | 3.97s |   OOM  |
-|   4  |   100%   | 2.48s | 4.84s |   OOM  |
-|   4  |  16:32   | 2.41s | 5.14s | 17.05s |
+| Bits | Sparsity | OPT-125M | OPT-2.7B | OPT-13B  | LLaMA-7B |
+| ---- | :------: | :------: | :------: | :------: | :------: |
+|  16  |   100%   |   2.30s  |   3.97s  |    OOM   |   OOM    |
+|   4  |   100%   |   2.48s  |   4.84s  |    OOM   |   9.95s  |
+|   4  |  16:32   |   2.41s  |   5.14s  |  17.05s  |  11.03s  |
+
 
 Below is the same data, but converted to tokens per second for convenience:
 
-| Bits | Sparsity |   125M  |   2.7B  |   13B   |
-|------| -------- | ------- | ------- | ------- |
-|  16  |   100%   | 34.8t/s | 20.2t/s |   OOM   |
-|   4  |   100%   | 32.3t/s | 16.5t/s |   OOM   |
-|   4  |  16:32   | 33.2t/s | 15.6t/s | 4.7 t/s |
+| Bits | Sparsity | OPT-125M | OPT-2.7B | OPT-13B | LLaMA-7B |
+|------| -------- | :------: | :------: | :-----: | :------: |
+|  16  |   100%   |  34.8t/s |  20.2t/s |   OOM   |   OOM    |
+|   4  |   100%   |  32.3t/s |  16.5t/s |   OOM   |  8.04t/s |
+|   4  |  16:32   |  33.2t/s |  15.6t/s |  4.7t/s |  7.25t/s |
+
+
+OPT tests were generated via KoboldAI. Time was measured from the front-end (by hacking up the little Execution Time indicator to give me more decimal places--very scientific, I know.)
+
+Preliminary LLaMA tests were done via oobabooga's text-generation-ui. Time was measured as reported from the command line. All tests were run with --no-stream enabled.
