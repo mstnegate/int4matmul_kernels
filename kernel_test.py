@@ -3,11 +3,35 @@ import int4matmul
 import numpy as np
 import time
 
+################################################################################
+
+# sparsity structure; this is # of total weights (non-zero weights is half that)
+SPARSE_BLOCK_SIZE = 32
+
 torch.manual_seed(123)
 np.random.seed(123)
-
 FLOAT_T = torch.float16
-SPARSE_BLOCK_SIZE = 32
+
+################################################################################
+
+# debugging options; you only really need to touch these if you're doing
+# kernel development
+
+# only run first test case for 5 iterations (6 total)
+PROFILING_MODE = False
+# ignore errors
+I_LIVE_LIFE_ON_THE_EDGE = False
+# drop into a debugger session if error is too high
+BREAK_ON_ERROR = False
+# what it says on the tin
+PRINT_KERNEL_OUTPUTS = False
+
+# different parts of data to randomize
+RANDOMIZE_WEIGHTS = True
+RANDOMIZE_ZEROPOINTS = True
+RANDOMIZE_SCALES = True
+RANDOMIZE_STATES = True
+RANDOMIZE_SPARSE_MASK = True
 
 ################################################################################
 
@@ -39,8 +63,15 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
     """
 
     b_Wq = torch.randint(0, 16, (hidden_dim, mtx_size), dtype=torch.int, device="cuda:0")
-    zeros = ((torch.rand((hidden_dim,), dtype=dtype, device="cuda:0") * 2.0) - 1)
-    scales = ((torch.rand((hidden_dim,), dtype=dtype, device="cuda:0") * 2.0) - 1)
+    zeros = torch.randint(0, 16, (hidden_dim,), dtype=torch.int, device="cuda:0").to(torch.float16)
+    scales = ((torch.rand((hidden_dim,), dtype=dtype, device="cuda:0") * 1.0) + 0.01)
+
+    if not RANDOMIZE_WEIGHTS:
+        b_Wq = (b_Wq)*0 + 1
+    if not RANDOMIZE_ZEROPOINTS:
+        zeros = zeros*0 + 0.0
+    if not RANDOMIZE_SCALES:
+        scales = scales*0.0 + 1.0
 
     if sparse:
         sparse_mask = torch.ones((hidden_dim, mtx_size), dtype=dtype, device="cuda:0")
@@ -53,10 +84,17 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
         # pregenerate "random" sparse masks; we don't need actual random masks
         # to test the kernel anyway
         RANDOM_OPTIONS = 1024
-        N_CHOICES = np.array([
-            np.random.choice(itms, size=(SPARSE_BLOCK_SIZE//2,), replace=False)
-            for _ in range(RANDOM_OPTIONS)
-        ])
+        if RANDOMIZE_SPARSE_MASK:
+            N_CHOICES = np.array([
+                np.random.choice(itms, size=(SPARSE_BLOCK_SIZE//2,), replace=False)
+                for _ in range(RANDOM_OPTIONS)
+            ])
+        else:
+            N_CHOICES = np.array([
+                # np.arange(0, SPARSE_BLOCK_SIZE, 2)
+                np.arange(SPARSE_BLOCK_SIZE//2, SPARSE_BLOCK_SIZE, 1)
+                for _ in range(RANDOM_OPTIONS)
+            ])
 
         rstr = np.random.randint(0, RANDOM_OPTIONS, size=(hidden_dim, mtx_size//SPARSE_BLOCK_SIZE))
         rrange = np.arange(0, mtx_size, SPARSE_BLOCK_SIZE, dtype=int)
@@ -95,7 +133,10 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
     return W, hiW, (Wq, zeros, scales, sparse_q)
 
 def generate_hidden_states(seq_len, mtx_size, batch_size=1, dtype=torch.float16):
-    return ((torch.rand((batch_size, seq_len, mtx_size), dtype=dtype, device="cuda:0") * 2.0) - 1)
+    states = ((torch.rand((batch_size, seq_len, mtx_size), dtype=dtype, device="cuda:0") * 2.0) - 1)
+    if not RANDOMIZE_STATES:
+        states = (states*0.0) + 1.0
+    return states
 
 ################################################################################
 
@@ -117,14 +158,14 @@ def abs_error(truth, candidate):
 
 ################################################################################
 
-def run_test_case(mtx_size, hidden_dim, seq_len, sparse, dtype, n_repeats=100):
+def run_test_case(batch_size, mtx_size, hidden_dim, seq_len, sparse, dtype, n_repeats=100):
     error = {}
     runtimes = {}
     avg_runtime = {}
 
     W, hiW, (Wq, zeros, scales, sparse_q) = generate_weights_matrix(
         hidden_dim, mtx_size, sparse, dtype=dtype)
-    x = generate_hidden_states(seq_len, mtx_size, 2, dtype=dtype)
+    x = generate_hidden_states(seq_len, mtx_size, batch_size, dtype=dtype)
 
     mm_ff = fp16_fp16_matmul(W, x)
     mm_ff_32 = fp32_fp32_matmul(hiW, x)
@@ -133,7 +174,18 @@ def run_test_case(mtx_size, hidden_dim, seq_len, sparse, dtype, n_repeats=100):
     error["fp16,fp16"] = abs_error(mm_ff_32, mm_ff)
     error["int4,fp16"] = abs_error(mm_ff_32, mm_if)
 
+    if (PRINT_KERNEL_OUTPUTS):
+        print(mm_ff)
+        print(mm_if)
+        print(error)
+
+    if BREAK_ON_ERROR and (error["int4,fp16"] > 0.1):
+        import pdb; pdb.set_trace()
+
     N_TRIALS = 5
+    if PROFILING_MODE:
+        N_TRIALS = 1
+        n_repeats = 5
 
     for name, func in [
         ("fp16,fp16", lambda: fp16_fp16_matmul(W, x)),
@@ -157,35 +209,61 @@ def run_test_case(mtx_size, hidden_dim, seq_len, sparse, dtype, n_repeats=100):
 
 if __name__ == "__main__":
     TRIALS = [
-        # mtx size, hidden dim, seq len, sparse
-        (128, 128, 2048, False),
-        (128, 128, 2048, True),
-        (1024, 1024, 2048, False),
-        (1024, 1024, 2048, True),
-        (16384, 4096, 2048, False),
-        (16384, 4096, 2048, True),
-        (1024, 1024, 1, False),
-        (1024, 1024, 1, True),
-        (16384, 16384, 1, False),
-        (16384, 16384, 1, True),
+        # batch size, mtx size, hidden dim, seq len, sparse
+        (1, 128, 128, 2048, False),
+        (1, 128, 128, 2048, True),
+        (1, 1024, 1024, 2048, False),
+        (1, 1024, 1024, 2048, True),
+        (1, 20480, 5120, 2048, False),
+        (1, 20480, 5120, 2048, True),
+        (1, 5120, 20480, 2048, False),
+        (1, 5120, 20480, 2048, True),
+        (1, 1024, 1024, 1, False),
+        (1, 5120, 5120, 1, False),
+        (1, 16384, 16384, 1, False),
+        (1, 20480, 5120, 1, False),
+        (1, 5120, 20480, 1, False),
+        (1, 5120, 5120, 1, True),
+        (1, 5120, 20480, 1, True),
+        (1, 16384, 16384, 1, True),
+        (1, 20480, 5120, 1, True),
     ]
 
     runtime_table = []
 
-    for trial_params in TRIALS:
-        mtx_size, hidden_dim, seq_len, is_sparse = trial_params
+    if PROFILING_MODE:
+        TRIALS = TRIALS[:1]
 
-        error, avg_runtime, runtimes = run_test_case(mtx_size, hidden_dim, seq_len, is_sparse, dtype=FLOAT_T)
+    for trial_params in TRIALS:
+        batch_size, mtx_size, hidden_dim, seq_len, is_sparse = trial_params
+
+        error, avg_runtime, runtimes = run_test_case(batch_size, mtx_size, hidden_dim, seq_len, is_sparse, dtype=FLOAT_T)
 
         max_error = max(abs(e) for e in error.values())
-        if max_error > 0.1:
-            raise ValueError("Test case %r had test error %r; stopping" % (trial_params, max_error))
+
+        # we define a serious error as:
+        # 1. either BOTH cases have finite error (inf pops up if fp32 precision
+        #    gives a 0 in the output), AND error exceeds 10%
+        # 2. OR: int4-fp16 does not have finite error but fp16 does
+        # (if fp16 has non-finite error, we don't care)
+        is_probably_serious = (
+            torch.isfinite(error["fp16,fp16"])
+            and torch.isfinite(error["int4,fp16"])
+            and max_error > 0.1
+        ) or (torch.isfinite(error["fp16,fp16"]) and not torch.isfinite(error["int4,fp16"]))
+
+        if is_probably_serious:
+            if not I_LIVE_LIFE_ON_THE_EDGE:
+                raise ValueError("Test case %r had test error %r; stopping" % (trial_params, error))
+            else:
+                print("Test case %r had test error %r; but let's keep going anyway and see what happens" % (trial_params, max_error))
 
         for k,v in avg_runtime.items():
             l, r = k.split(",")
 
             runtime_table.append(
                 [
+                    batch_size,
                     mtx_size,
                     hidden_dim,
                     seq_len,
@@ -201,7 +279,7 @@ if __name__ == "__main__":
 
     c = zip(*runtime_table)
     col_names = [
-        "S", "N", "M", "", "", "", "Time (µs)",
+        "B", "S", "N", "M", "", "", "", "Time (µs)",
     ]
     for col, col_name in zip(c, col_names):
         col = [str(x) for x in col]
@@ -212,7 +290,7 @@ if __name__ == "__main__":
         lines[1].append(("-"*(max_len-2)).center(max_len))
 
         for i, v in enumerate(col):
-            # TODO: multiplier calculation
+            # TODO: % loss relative-to-fp16 calculation
             lines[i+2].append(v.rjust(max_len-1) + " ")
 
-    print("\n".join("|".join(line) for line in lines))
+    print("\n".join("|%s|" % "|".join(line) for line in lines))
