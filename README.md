@@ -46,7 +46,7 @@ These benchmarks were run/generated via `kernel_test.py` on a RTX 3080 10G.
 
 ### Matrix-vector
 
-Special case where M=1 (common for inferencing if kv caching is implemented.)
+Special case where S=1 (common for inferencing if kv caching is implemented.)
 
 | B  |   S    |   N    | M  |        |       |       | Time (µs)  |
 | -- | ------ | ------ | -- | ------ | ----- | ----- | ---------- |
