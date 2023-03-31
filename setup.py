@@ -9,6 +9,7 @@ setup(
             [
                 'int4matmul.cpp',
                 'matmul_kernel.cu',
+                'matvec_kernel.cu',
                 'utils_kernel.cu',
             ],
             extra_compile_args={'nvcc': ['-O2', '--generate-line-info']},

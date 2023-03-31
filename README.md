@@ -1,6 +1,6 @@
 This repository contains CUDA kernels for [quantized] int4-fp16 matrix multiplication. They were written for [reduced-kobold](https://github.com/mstnegate/reduced-kobold/), but should be usable for anything which packs data in the same way.
 
-The kernels are lightly optimized; see microbenchmarks below. TL;DR: slowdown is around 1.1-1.3x for dense matmul and ~2x for sparse matmul. Actual inference numbers may vary because torch is weird. 
+The kernels are lightly optimized; see microbenchmarks below. TL;DR: matmul is ~1.2x slower for dense, ~2x slower for sparse; matvec is ~3x faster for dense, ~2x for sparse (at least for me.)
 
 Currently the kernels support quantized int4-fp16 multiplication with optional 16:32 structured sparsity. Group quantization is not supported currently. All dimensions (except sequence length) must be a multiple of 64 currently. This was true for every model I've tested, but feel free to open an issue if you have some legitimate use case where this isn't true.
 
@@ -16,7 +16,7 @@ To build, just run `python setup.py install` in whatever env you need these in; 
 
 ## Benchmarks
 
-Below are [unscientific] microbenchmarks; "real-world" inferencing benchmarks coming soon (whenever I get the matvec kernels finished.)
+Below are [unscientific] microbenchmarks; proper "real-world" inferencing benchmarks coming at some point.
 
 These benchmarks were run/generated via `kernel_test.py` on a RTX 3080 10G.
 
@@ -46,25 +46,25 @@ These benchmarks were run/generated via `kernel_test.py` on a RTX 3080 10G.
 
 ### Matrix-vector
 
-Special case where M=1. Note that there currently isn't any matrix-vector kernel specialization (coming soon!) so this scenario is extremely computationally wasteful.
+Special case where M=1 (common for inferencing if kv caching is implemented.)
 
-| B  |   S    |   N    |   M   |        |       |       | Time (µs)  |
-| -- | ------ | ------ | ----- | ------ | ----- | ----- | ---------- |
-|  1 |   1024 |   1024 |     1 |        |  fp16 |  fp16 |      15.64 |
-|  1 |   1024 |   1024 |     1 |        |  int4 |  fp16 |      31.27 |
-|  1 |   5120 |   5120 |     1 |        |  fp16 |  fp16 |      97.71 |
-|  1 |   5120 |   5120 |     1 |        |  int4 |  fp16 |     162.21 |
-|  1 |  16384 |  16384 |     1 |        |  fp16 |  fp16 |     799.30 |
-|  1 |  16384 |  16384 |     1 |        |  int4 |  fp16 |     759.28 |
-|  1 |  20480 |   5120 |     1 |        |  fp16 |  fp16 |     308.77 |
-|  1 |  20480 |   5120 |     1 |        |  int4 |  fp16 |     598.01 |
-|  1 |   5120 |  20480 |     1 |        |  fp16 |  fp16 |     343.95 |
-|  1 |   5120 |  20480 |     1 |        |  int4 |  fp16 |     295.10 |
-|  1 |   5120 |   5120 |     1 |  16:32 |  fp16 |  fp16 |     101.62 |
-|  1 |   5120 |   5120 |     1 |  16:32 |  int4 |  fp16 |     234.51 |
-|  1 |   5120 |  20480 |     1 |  16:32 |  fp16 |  fp16 |     365.45 |
-|  1 |   5120 |  20480 |     1 |  16:32 |  int4 |  fp16 |     504.20 |
-|  1 |  16384 |  16384 |     1 |  16:32 |  fp16 |  fp16 |     879.43 |
-|  1 |  16384 |  16384 |     1 |  16:32 |  int4 |  fp16 |    1330.87 |
-|  1 |  20480 |   5120 |     1 |  16:32 |  fp16 |  fp16 |     347.86 |
-|  1 |  20480 |   5120 |     1 |  16:32 |  int4 |  fp16 |     889.20 |
+| B  |   S    |   N    | M  |        |       |       | Time (µs)  |
+| -- | ------ | ------ | -- | ------ | ----- | ----- | ---------- |
+|  1 |   1024 |   1024 |  1 |        |  fp16 |  fp16 |      15.64 |
+|  1 |   1024 |   1024 |  1 |        |  int4 |  fp16 |      41.23 |
+|  1 |   5120 |   5120 |  1 |        |  fp16 |  fp16 |      96.95 |
+|  1 |   5120 |   5120 |  1 |        |  int4 |  fp16 |      42.09 |
+|  1 |  16384 |  16384 |  1 |        |  fp16 |  fp16 |     802.68 |
+|  1 |  16384 |  16384 |  1 |        |  int4 |  fp16 |     257.95 |
+|  1 |  20480 |   5120 |  1 |        |  fp16 |  fp16 |     303.23 |
+|  1 |  20480 |   5120 |  1 |        |  int4 |  fp16 |     105.53 |
+|  1 |   5120 |  20480 |  1 |        |  fp16 |  fp16 |     327.31 |
+|  1 |   5120 |  20480 |  1 |        |  int4 |  fp16 |     105.86 |
+|  1 |   5120 |   5120 |  1 |  16:32 |  fp16 |  fp16 |      98.74 |
+|  1 |   5120 |   5120 |  1 |  16:32 |  int4 |  fp16 |      50.81 |
+|  1 |   5120 |  20480 |  1 |  16:32 |  fp16 |  fp16 |     355.83 |
+|  1 |   5120 |  20480 |  1 |  16:32 |  int4 |  fp16 |     142.83 |
+|  1 |  16384 |  16384 |  1 |  16:32 |  fp16 |  fp16 |    1004.64 |
+|  1 |  16384 |  16384 |  1 |  16:32 |  int4 |  fp16 |     345.91 |
+|  1 |  20480 |   5120 |  1 |  16:32 |  fp16 |  fp16 |     332.24 |
+|  1 |  20480 |   5120 |  1 |  16:32 |  int4 |  fp16 |     144.62 |
