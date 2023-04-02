@@ -25,6 +25,7 @@
 
 #define WARP_SIZE 32
 #define FULL_MASK 0xFFFFFFFF
+#define MSK 0xF
 
 // everything takes these
 #define BASE_BOILERPLATE_ARGS(T, OT, U) \
@@ -47,8 +48,6 @@
 #define RECEIVE_BOILERPLATE_ARGS(T) BASE_BOILERPLATE_ARGS(T, T, int32_t)
 #define RECEIVE_BOILERPLATE_ACCUM_ARGS(T, O) BASE_BOILERPLATE_ARGS(T, O, int32_t)
 #define RECEIVE_SPARSE_MASK_ARGS BASE_SPARSE_MASK_ARGS(int32_t)
-
-#define MSK 0xF
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -117,14 +116,14 @@ struct gmem_load_weights<false, STRIDE> {
         const size_t out_size
     ) {
         // sparse_mask is unused, of course
-
-        const uint32_t* wt_in = wt_mtx + j_pos + j_offset + ((i_pos + i_offset) * out_size);
-        uint32_t* wt_out = buf + STRIDE*i_offset + j_offset;
+        const size_t down_size = (BLOCK_SIZE/8/2);
+        const uint32_t* wt_in = wt_mtx + j_pos + j_offset + ((i_pos + i_offset*down_size) * out_size);
+        uint32_t* wt_out = buf + STRIDE*i_offset*down_size + j_offset;
         #pragma unroll
-        for(auto i = 0; i < (BLOCK_SIZE / 8 / 2); ++i) {
+        for(auto i = 0; i < down_size; ++i) {
             *wt_out = *wt_in;
-            wt_in += 2*out_size;
-            wt_out += 2*STRIDE;
+            wt_in += out_size;
+            wt_out += STRIDE;
         }
     }
 };
@@ -200,11 +199,13 @@ struct smem_unpack_weights<false, STRIDE_IN, STRIDE_OUT> {
         const __half scale,
         const __half zero
     ) {
-        const uint32_t* wt_in = packed_wts + j_offset + STRIDE_IN*i_offset;
-        __half* wt_out = unpacked_wts + j_offset + STRIDE_OUT*i_offset*8;
+        const size_t down_size = (BLOCK_SIZE/8/2);
+
+        const uint32_t* wt_in = packed_wts + j_offset + STRIDE_IN*i_offset*down_size;
+        __half* wt_out = unpacked_wts + j_offset + STRIDE_OUT*i_offset*8*down_size;
 
         #pragma unroll
-        for(auto i = 0; i < (BLOCK_SIZE / 8 / 2); ++i) {
+        for(auto i = 0; i < down_size; ++i) {
             uint32_t v = *wt_in;
             #pragma unroll
             for(auto j = 0; j < 8; ++j) {
@@ -212,9 +213,7 @@ struct smem_unpack_weights<false, STRIDE_IN, STRIDE_OUT> {
                 v >>= 4;
                 wt_out += STRIDE_OUT;
             }
-            wt_in += 2*STRIDE_IN;
-            // we advanced a set of 8 all on our own; hence only jump 8 more
-            wt_out += 8*STRIDE_OUT;
+            wt_in += STRIDE_IN;
         }
     }
 };
