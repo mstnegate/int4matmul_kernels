@@ -34,6 +34,7 @@
     const T* __restrict__ multiplier, \
     const T* __restrict__ scales, \
     const T* __restrict__ zeros, \
+    const size_t group_size, \
     const size_t in_size, \
     const size_t seq_len, \
     const size_t mtx_in_size, \
@@ -73,9 +74,21 @@
 #define SB_DIM_K (WMMA_CHUNK_COUNT)
 
 ////////////////////////////////////////////////////////////////////////////////
-// function decls for common functionality
+// decls for common functionality
 
-__device__ inline __half dequantize(uint32_t v, const __half scale, const __half zero) {
+enum class Quantization {
+    LINEAR,
+    EXPONENT_SYM,
+    DYNAMIC_EXPONENT_SYM,
+};
+
+#define DEQUANTIZZE_ARGS \
+    uint32_t v, const __half scale, const __half zero
+template <Quantization qm>
+__device__ inline __half dequantize(DEQUANTIZZE_ARGS);
+
+template<>
+__device__ inline __half dequantize<Quantization::LINEAR>(DEQUANTIZZE_ARGS) {
     #ifndef FMA_TRANSFORM
         return __hmul(__hsub(__uint2half_rn(v & MSK), zero), scale);
     #else
@@ -83,6 +96,19 @@ __device__ inline __half dequantize(uint32_t v, const __half scale, const __half
     #endif
 };
 
+#define EXP_MSK 0x7
+template<>
+__device__ inline __half dequantize<Quantization::EXPONENT_SYM>(DEQUANTIZZE_ARGS) {
+    int32_t iv = (v & 0x8 ? -1 : 1) * (int)(1 << (v & EXP_MSK));
+    return __hfma(__int2half_rn(iv), scale, zero);
+};
+
+template<>
+__device__ inline __half dequantize<Quantization::DYNAMIC_EXPONENT_SYM>(DEQUANTIZZE_ARGS) {
+    // for efficiency this needs to be handled further up in the call stack
+    assert(0);
+};
+#undef DEQUANTIZZE_ARGS
 
 ////////////////////////////////////////////////////////////////////////////////
 // off-loaded loads
@@ -90,31 +116,24 @@ __device__ inline __half dequantize(uint32_t v, const __half scale, const __half
 // TODO: true 3-bit specializations
 
 // function partial specialization isn't really a thing, so...
+
+#define LOAD_WEIGHTS_ARGS \
+    const uint32_t* __restrict__ wt_mtx, \
+    uint32_t* __restrict__ buf, \
+    const uint32_t* __restrict__ sparse_mask, \
+    const size_t i_offset, \
+    const size_t j_offset, \
+    const size_t i_pos, \
+    const size_t j_pos, \
+    const size_t out_size
+
 template<bool is_sparse, size_t STRIDE>
 struct gmem_load_weights {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ wt_mtx,
-        uint32_t* __restrict__ buf,
-        const uint32_t* __restrict__ sparse_mask,
-        const size_t i_offset,
-        const size_t j_offset,
-        const size_t i_pos,
-        const size_t j_pos,
-        const size_t out_size
-    );
+    __device__ inline static void load(LOAD_WEIGHTS_ARGS);
 };
 template<size_t STRIDE>
 struct gmem_load_weights<false, STRIDE> {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ wt_mtx,
-        uint32_t* __restrict__ buf,
-        const uint32_t* __restrict__ sparse_mask,
-        const size_t i_offset,
-        const size_t j_offset,
-        const size_t i_pos,
-        const size_t j_pos,
-        const size_t out_size
-    ) {
+    __device__ inline static void load(LOAD_WEIGHTS_ARGS) {
         // sparse_mask is unused, of course
         const size_t down_size = (BLOCK_SIZE/8/2);
         const uint32_t* wt_in = wt_mtx + j_pos + j_offset + ((i_pos + i_offset*down_size) * out_size);
@@ -129,16 +148,7 @@ struct gmem_load_weights<false, STRIDE> {
 };
 template<size_t STRIDE>
 struct gmem_load_weights<true, STRIDE> {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ wt_mtx,
-        uint32_t* __restrict__ buf,
-        const uint32_t* __restrict__ sparse_mask,
-        const size_t i_offset,
-        const size_t j_offset,
-        const size_t i_pos,
-        const size_t j_pos,
-        const size_t out_size
-    ) {
+    __device__ inline static void load(LOAD_WEIGHTS_ARGS) {
         // housekeeping note: we normally have N rows of data; due to sparsity
         // we now have N//2, then N//4 masking entries; the weights are stored
         // at the top of the buffer and the masks at the bottom
@@ -174,31 +184,25 @@ struct gmem_load_weights<true, STRIDE> {
     }
 };
 
+#undef LOAD_WEIGHTS_ARGS
 
-template<bool is_sparse, size_t STRIDE_IN, size_t STRIDE_OUT>
-struct smem_unpack_weights {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ packed_wts,
-        __half* __restrict__ unpacked_wts,
-        const size_t i_offset,
-        const size_t j_offset,
-        const __half scale,
-        const __half zero
-    );
+
+#define UNPACK_WEIGHTS_ARGS \
+    const uint32_t* __restrict__ packed_wts, \
+    __half* __restrict__ unpacked_wts, \
+    const size_t i_offset, \
+    const size_t j_offset, \
+    const __half scale, \
+    const __half zero
+
+template<bool is_sparse, size_t STRIDE_IN, size_t STRIDE_OUT, Quantization qm>
+struct smem_unpack_weights_inner {
+    __device__ inline static void load(UNPACK_WEIGHTS_ARGS);
 };
 
-template<size_t STRIDE_IN, size_t STRIDE_OUT>
-struct smem_unpack_weights<false, STRIDE_IN, STRIDE_OUT> {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ packed_wts,
-        __half* __restrict__ unpacked_wts,
-
-        const size_t i_offset,
-        const size_t j_offset,
-
-        const __half scale,
-        const __half zero
-    ) {
+template<size_t STRIDE_IN, size_t STRIDE_OUT, Quantization qm>
+struct smem_unpack_weights_inner<false, STRIDE_IN, STRIDE_OUT, qm> {
+    __device__ inline static void load(UNPACK_WEIGHTS_ARGS) {
         const size_t down_size = (BLOCK_SIZE/8/2);
 
         const uint32_t* wt_in = packed_wts + j_offset + STRIDE_IN*i_offset*down_size;
@@ -209,7 +213,7 @@ struct smem_unpack_weights<false, STRIDE_IN, STRIDE_OUT> {
             uint32_t v = *wt_in;
             #pragma unroll
             for(auto j = 0; j < 8; ++j) {
-                *wt_out = dequantize(v, scale, zero);
+                *wt_out = dequantize<qm>(v, scale, zero);
                 v >>= 4;
                 wt_out += STRIDE_OUT;
             }
@@ -217,7 +221,6 @@ struct smem_unpack_weights<false, STRIDE_IN, STRIDE_OUT> {
         }
     }
 };
-
 
 #ifndef RESPECT_STRICT_ALIASING
 struct WIDE_S_SB {
@@ -236,18 +239,9 @@ union WIDE_S {
 };
 #endif
 
-template<size_t STRIDE_IN, size_t STRIDE_OUT>
-struct smem_unpack_weights<true, STRIDE_IN, STRIDE_OUT> {
-    __device__ inline static void load(
-        const uint32_t* __restrict__ packed_wts,
-        __half* __restrict__ unpacked_wts,
-
-        const size_t i_offset,
-        const size_t j_offset,
-
-        const __half scale,
-        const __half zero
-    ) {
+template<size_t STRIDE_IN, size_t STRIDE_OUT, Quantization qm>
+struct smem_unpack_weights_inner<true, STRIDE_IN, STRIDE_OUT, qm> {
+    __device__ inline static void load(UNPACK_WEIGHTS_ARGS) {
         const __half ZERO = __float2half(0.0f);
         const size_t MASK_ROWS = (BLOCK_SIZE / 8 / 4);
 
@@ -292,14 +286,14 @@ struct smem_unpack_weights<true, STRIDE_IN, STRIDE_OUT> {
 
                 ulsb = threadIdx.x < 8 ? ulsb : umsb;
                 ulsb >>= (4 * (threadIdx.x % 8));
-                __half h = dequantize(ulsb, wscale, wzero);
+                __half h = dequantize<qm>(ulsb, wscale, wzero);
             #else
                 uint64_t p = __shfl_sync(FULL_MASK, sb.p, wi);
                 const WIDE_S usb = *(WIDE_S*)&p;
                 p = __shfl_sync(FULL_MASK, aux.p, wi);
                 const WIDE_S uaux = *(WIDE_S*)&p;
 
-                __half h = dequantize(
+                __half h = dequantize<qm>(
                     (threadIdx.x < 8 ? usb.sb.lsb : usb.sb.msb) >> (4 * (threadIdx.x % 8)),
                     uaux.aux.scale, uaux.aux.zero);
 
@@ -317,3 +311,29 @@ struct smem_unpack_weights<true, STRIDE_IN, STRIDE_OUT> {
         __syncthreads();
     }
 };
+
+
+template<bool is_sparse, size_t STRIDE_IN, size_t STRIDE_OUT, Quantization qm>
+struct smem_unpack_weights {
+    __device__ inline static void load(UNPACK_WEIGHTS_ARGS) {
+        smem_unpack_weights_inner<is_sparse, STRIDE_IN, STRIDE_OUT, qm>::load(packed_wts, unpacked_wts, i_offset, j_offset, scale, zero);
+    }
+};
+template<bool is_sparse, size_t STRIDE_IN, size_t STRIDE_OUT>
+struct smem_unpack_weights<is_sparse, STRIDE_IN, STRIDE_OUT, Quantization::DYNAMIC_EXPONENT_SYM> {
+    __device__ inline static void load(UNPACK_WEIGHTS_ARGS) {
+        // TODO: add a compile-flagged ballot check to make sure warps are synced
+
+        // WARNING: this assumes that the entire warp branches the same way!
+        if (__hge(scale, __float2half(0.0f))) {
+            smem_unpack_weights_inner<is_sparse, STRIDE_IN, STRIDE_OUT, Quantization::LINEAR>::load(
+                packed_wts, unpacked_wts, i_offset, j_offset, scale, zero);
+        } else {
+            smem_unpack_weights_inner<is_sparse, STRIDE_IN, STRIDE_OUT, Quantization::EXPONENT_SYM>::load(
+                packed_wts, unpacked_wts, i_offset, j_offset, __hneg(scale), zero);
+        }
+    }
+};
+
+
+#undef UNPACK_WEIGHTS_ARGS

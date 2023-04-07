@@ -7,6 +7,7 @@ import time
 
 # sparsity structure; this is # of total weights (non-zero weights is half that)
 SPARSE_BLOCK_SIZE = 32
+GROUP_QUANTIZATION_SIZE = 128
 
 torch.manual_seed(123)
 np.random.seed(123)
@@ -35,6 +36,8 @@ RANDOMIZE_SPARSE_MASK = True
 
 ################################################################################
 
+# TODO: enable testing of dynamic exponent
+
 def _pack_sparse_matrices(hidden_dim, mtx_size, weights, sparse_mask):
     f_Wq = torch.empty((mtx_size//16, hidden_dim), dtype=torch.int, device="cuda:0")
     f_sparse_q = torch.empty((mtx_size//32, hidden_dim), dtype=torch.int, device="cuda:0")
@@ -45,6 +48,27 @@ def _pack_sparse_matrices(hidden_dim, mtx_size, weights, sparse_mask):
         sparse_mask.to(torch.uint8)
     )
     return f_Wq, f_sparse_q
+
+def generate_dequantized_mtx(weights, zeros, scales, n_groups):
+    if len(zeros.shape) == 1:
+        W = ((weights - zeros[:, None]) * scales[:, None]).T
+        hiW = ((weights.to(torch.float32) - zeros[:, None].to(torch.float32)) * scales[:, None].to(torch.float32)).T
+    else:
+        W = weights.clone().to(torch.float16)
+        hiW = weights.clone().to(torch.float32)
+
+        for i in range(n_groups):
+            slc = slice(i*GROUP_QUANTIZATION_SIZE, (i+1)*GROUP_QUANTIZATION_SIZE)
+            z = zeros[i, :][:, None]
+            s = scales[i, :][:, None]
+
+            W[:, slc] = (W[:, slc] - z)*s
+            hiW[:, slc] = (hiW[:, slc] - z.to(torch.float32))*s.to(torch.float32)
+
+        W = W.T
+        hiW = hiW.T
+
+    return W, hiW
 
 
 def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.float16):
@@ -63,8 +87,16 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
     """
 
     b_Wq = torch.randint(0, 16, (hidden_dim, mtx_size), dtype=torch.int, device="cuda:0")
-    zeros = torch.randint(0, 16, (hidden_dim,), dtype=torch.int, device="cuda:0").to(torch.float16)
-    scales = ((torch.rand((hidden_dim,), dtype=dtype, device="cuda:0") * 1.0) + 0.01)
+
+    if GROUP_QUANTIZATION_SIZE in (-1, None):
+        n_groups = 1
+        shape = (hidden_dim,)
+    else:
+        n_groups = int(np.ceil(mtx_size / GROUP_QUANTIZATION_SIZE))
+        shape = (n_groups, hidden_dim,)
+
+    zeros = torch.randint(0, 16, shape, dtype=torch.int, device="cuda:0").to(torch.float16)
+    scales = ((torch.rand(shape, dtype=dtype, device="cuda:0") * 1.0) + 0.01)
 
     if not RANDOMIZE_WEIGHTS:
         b_Wq = (b_Wq)*0 + 1
@@ -103,8 +135,7 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
     else:
         sparse_q = None
 
-    W = ((b_Wq - zeros[:, None]) * scales[:, None]).T
-    hiW = ((b_Wq.to(torch.float32) - zeros[:, None].to(torch.float32)) * scales[:, None].to(torch.float32)).T
+    W, hiW = generate_dequantized_mtx(b_Wq, zeros, scales, n_groups)
 
     if sparse:
         Wq, sparse_q = _pack_sparse_matrices(hidden_dim, mtx_size, b_Wq, sparse_mask)
@@ -149,7 +180,7 @@ def fp32_fp32_matmul(W, x):
 def fp16_int4_matmul(Wq, x, scales, zeros, sparse_q):
     outs = torch.zeros((x.shape[0], x.shape[1], Wq.shape[1]), dtype=FLOAT_T, device="cuda:0")
     int4matmul.quant_int4_linear_mult(
-        outs, Wq, x, scales, zeros, sparse_q
+        outs, Wq, x, scales, zeros, GROUP_QUANTIZATION_SIZE, sparse_q
     )
     return outs
 

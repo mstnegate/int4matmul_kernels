@@ -309,19 +309,6 @@ __device__ void MMA_Int4_Half(
     const size_t warpSuperIdx = warpIdx / 2;
     const size_t warpOffset = warpSubIdx * WARP_SIZE + threadIdx.x;
 
-    __half scale = ZERO;
-    __half zero = ZERO;
-    {
-        const auto j_idx = (blockIdx.x*BLOCK_SIZE + warpOffset);
-        if (j_idx < out_size) {
-            scale = scales[j_idx];
-            zero = zeros[j_idx];
-            #ifdef FMA_TRANSFORM
-                zero = __hneg(__hmul(zero, scale))
-            #endif
-        }
-    }
-    __syncthreads();
 
     // adjust for batch dim
     multiplier += blockIdx.z*seq_len*in_size;
@@ -336,7 +323,21 @@ __device__ void MMA_Int4_Half(
         }
     }
 
+
+    // TODO: bake in group quant fetches
+
     for(size_t mtx_i = 0; mtx_i < mtx_in_size; mtx_i += BLOCK_SIZE/8) {
+        __half scale = ZERO;
+        __half zero = ZERO;
+        {
+            const auto j_idx = (blockIdx.x*BLOCK_SIZE + warpOffset) + ((mtx_i*8)/group_size)*out_size;
+            scale = scales[j_idx];
+            zero = zeros[j_idx];
+            #ifdef FMA_TRANSFORM
+                zero = __hneg(__hmul(zero, scale))
+            #endif
+        }
+
         // GMEM loading chunk
 
         // grab the weights first since there's no bounds-checking to desync things
@@ -355,7 +356,7 @@ __device__ void MMA_Int4_Half(
         // everything is now in GMEM; all our operations now touch only SMEM
 
         // step 1: unpack packed weights from SMEM -> SMEM
-        smem_unpack_weights<is_sparse, BLOCK_SIZE, BUF_MTX_WIDTH>::load(
+        smem_unpack_weights<is_sparse, BLOCK_SIZE, BUF_MTX_WIDTH, Quantization::DYNAMIC_EXPONENT_SYM>::load(
             wt_buf, wt_unpacked_buf,
             warpSuperIdx, warpOffset,
             scale, zero);
@@ -409,7 +410,7 @@ __global__ void MMV_Int4_Dense<float>(
 ) {
     MMA_Int4_Float<false>(
         outs, reinterpret_cast<const uint32_t*>(matrix), multiplier, scales, zeros,
-        in_size, seq_len, mtx_in_size, out_size, nullptr
+        group_size, in_size, seq_len, mtx_in_size, out_size, nullptr
     );
 }
 template <>
@@ -419,7 +420,7 @@ __global__ void MMV_Int4_Sparse<float>(
 ) {
     MMA_Int4_Float<true>(
         outs, reinterpret_cast<const uint32_t*>(matrix), multiplier, scales, zeros,
-        in_size, seq_len, mtx_in_size, out_size, reinterpret_cast<const uint32_t*>(sparse_mask)
+        group_size, in_size, seq_len, mtx_in_size, out_size, reinterpret_cast<const uint32_t*>(sparse_mask)
     );
 }
 
@@ -435,7 +436,7 @@ __global__ void MMV_Int4_Dense<c10::Half>(
         reinterpret_cast<const __half*>(multiplier),
         reinterpret_cast<const __half*>(scales),
         reinterpret_cast<const __half*>(zeros),
-        in_size, seq_len, mtx_in_size, out_size, nullptr
+        group_size, in_size, seq_len, mtx_in_size, out_size, nullptr
     );
 }
 template <>
@@ -449,7 +450,7 @@ __global__ void MMV_Int4_Sparse<c10::Half>(
         reinterpret_cast<const __half*>(multiplier),
         reinterpret_cast<const __half*>(scales),
         reinterpret_cast<const __half*>(zeros),
-        in_size, seq_len, mtx_in_size, out_size,
+        group_size, in_size, seq_len, mtx_in_size, out_size,
         reinterpret_cast<const uint32_t*>(sparse_mask)
     );
 }
@@ -461,9 +462,17 @@ void matmul_int4(
     torch::Tensor x,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 ) {
     const bool is_sparse = sparse_mask.has_value() && sparse_mask.value().defined();
+
+    if (group_size < 0) {
+        // don't pick something too big in case of weird uint shenanigans
+        group_size = 0x0FFFFFFF;
+    } else {
+        assert(group_size % 64 == 0);
+    }
 
     // perform matrix multiplication:
     //    x * W^T = O
@@ -473,8 +482,8 @@ void matmul_int4(
     //
     // with zeros and scales such that
     //    W = scales * Wq + zeros
-    // scales : [out_size,]
-    // zeros  : [out_size,]
+    // scales : [n_groups, out_size,]
+    // zeros  : [n_groups, out_size,]
 
     const auto batch_size = x.size(0);
     const auto seq_len = x.size(1);
@@ -491,8 +500,11 @@ void matmul_int4(
     assert(outs.size(0) == batch_size);
     assert(outs.size(1) == seq_len);
     assert(outs.size(2) == out_size);
-    assert(zeros.size(0) == out_size);
-    assert(scales.size(0) == out_size);
+    assert(zeros.size(1) == out_size);
+    assert(scales.size(1) == out_size);
+    assert((group_size * zeros.size(0)) >= in_size);
+    assert((group_size * scales.size(0)) >= in_size);
+    assert(out_size % BLOCK_SIZE == 0);
 
     const auto THREAD_X = WARP_SIZE;
     const auto THREAD_Y = WMMA_CHUNK_COUNT;
@@ -518,7 +530,7 @@ void matmul_int4(
                 zeros.data<scalar_t>(),
                 // multiply mtx_in_size by 2 to pretend it's still in terms of
                 // weights; easier indexing
-                in_size, seq_len, mtx_in_size*2, out_size, actual_sparse.data<int32_t>()
+                group_size, in_size, seq_len, mtx_in_size*2, out_size, actual_sparse.data<int32_t>()
             );
         }));
     } else {
@@ -529,7 +541,7 @@ void matmul_int4(
                 x.data<scalar_t>(),
                 scales.data<scalar_t>(),
                 zeros.data<scalar_t>(),
-                in_size, seq_len, mtx_in_size, out_size
+                group_size, in_size, seq_len, mtx_in_size, out_size
             );
         }));
     }
