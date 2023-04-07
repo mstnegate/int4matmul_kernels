@@ -8,6 +8,7 @@ void matmul_int4(
     torch::Tensor multiplier,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 );
 void matvec_int4(
@@ -16,6 +17,7 @@ void matvec_int4(
     torch::Tensor multiplier,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 );
 
@@ -32,9 +34,10 @@ void quant_int4_linear_mult_mtx(
     torch::Tensor multiplier,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 ) {
-    matmul_int4(outs, matrix, multiplier, scales, zeros, sparse_mask);
+    matmul_int4(outs, matrix, multiplier, scales, zeros, group_size, sparse_mask);
 }
 void quant_int4_linear_mult_vec(
     torch::Tensor outs,
@@ -42,9 +45,10 @@ void quant_int4_linear_mult_vec(
     torch::Tensor multiplier,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 ) {
-    matvec_int4(outs, matrix, multiplier, scales, zeros, sparse_mask);
+    matvec_int4(outs, matrix, multiplier, scales, zeros, group_size, sparse_mask);
 }
 
 void quant_int4_linear_mult(
@@ -53,12 +57,13 @@ void quant_int4_linear_mult(
     torch::Tensor multiplier,
     torch::Tensor scales,
     torch::Tensor zeros,
+    int group_size,
     c10::optional<torch::Tensor> sparse_mask
 ) {
     if (multiplier.size(1) == 1) {
-        quant_int4_linear_mult_vec(outs, matrix, multiplier, scales, zeros, sparse_mask);
+        quant_int4_linear_mult_vec(outs, matrix, multiplier, scales, zeros, group_size, sparse_mask);
     } else {
-        quant_int4_linear_mult_mtx(outs, matrix, multiplier, scales, zeros, sparse_mask);
+        quant_int4_linear_mult_mtx(outs, matrix, multiplier, scales, zeros, group_size, sparse_mask);
     }
 }
 
