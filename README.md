@@ -24,7 +24,7 @@ Below are [unscientific] microbenchmarks; proper "real-world" inferencing benchm
 
 These benchmarks were run/generated via `kernel_test.py` on a RTX 3080 10G.
 
-(tests were done on a (B x S x N) states tensor and (N x M) weights matrix.)
+(tests were done on a (B x M x N) states tensor and (N x S) weights matrix.)
 
 ### Matrix-matrix
 
