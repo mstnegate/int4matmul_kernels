@@ -8,74 +8,6 @@ using namespace nvcuda;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-template <typename scalar_t>
-__device__ inline float _cast_out(scalar_t a) {
-    return (float)a;
-}
-template <>
-__device__ inline float _cast_out(unsigned int a) {
-    return (float)a;
-}
-template <>
-__device__ inline float _cast_out(__half a) {
-    return __half2float(a);
-}
-
-template <typename scalar_t>
-__device__ inline scalar_t _cast_from_accum(float a) {
-    return (scalar_t)a;
-}
-template <>
-__device__ inline float _cast_from_accum<float>(float a) {
-    return a;
-}
-template <>
-__device__ inline __half _cast_from_accum<__half>(float a) {
-    return __float2half(a);
-}
-
-
-////////////////////////////////////////////////////////////////////////////////
-// actual kernel stuff
-
-// CUDA boilerplate, don't question it
-template <bool is_sparse>
-__device__ void MMA_Int4_Float( BOILERPLATE_ARGS(float), SPARSE_MASK_ARGS );
-
-template <bool is_sparse>
-__device__ void MMA_Int4_Half( BOILERPLATE_ARGS(__half), SPARSE_MASK_ARGS );
-
-template <typename scalar_t>
-__global__ void MMV_Int4_Dense( RECEIVE_BOILERPLATE_ARGS(scalar_t) );
-
-template <typename scalar_t>
-__global__ void MMV_Int4_Sparse( RECEIVE_BOILERPLATE_ARGS(scalar_t), RECEIVE_SPARSE_MASK_ARGS );
-
-////////////////////////////////////////////////////////////////////////////////
-
-// invalid specializations
-
-// fp32 matmul not supported now; look for older commits (0d20a43 or older if
-// you need them for some reason)
-template <bool is_sparse>
-__device__ void MMA_Int4_Float<is_sparse>(
-    BOILERPLATE_ARGS(float),
-    SPARSE_MASK_ARGS
-) { assert(0); }
-
-template <typename scalar_t>
-__global__ void MMV_Int4_Dense(
-    RECEIVE_BOILERPLATE_ARGS(scalar_t)
-) { assert(0); }
-
-template <typename scalar_t>
-__global__ void MMV_Int4_Sparse<float>(
-    RECEIVE_BOILERPLATE_ARGS(scalar_t),
-    RECEIVE_SPARSE_MASK_ARGS
-) { assert(0); }
-
-////////////////////////////////////////////////////////////////////////////////
-
 union BUF_TYPE {
     __half h[BLOCK_SIZE * BUF_MTX_WIDTH];
     float f[BLOCK_SIZE * BUF_MTX_F32_WIDTH];
@@ -284,8 +216,7 @@ __device__ void smem_write_accs(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// temporary specialization
-template <bool is_sparse>
+template <bool is_sparse, uint32_t BITS>
 __device__ void MMA_Int4_Half(
     BOILERPLATE_ARGS(__half),
     SPARSE_MASK_ARGS
@@ -297,8 +228,7 @@ __device__ void MMA_Int4_Half(
     //       unpacking top-to-bottom; should save enough memory to boost warp
     //       occupancy on a 3080; stacking buffers vertically might make this
     //       easier (but cause bank conflicts (?))
-    __shared__ uint32_t wt_buf[(BLOCK_SIZE / 8) * BLOCK_SIZE];
-
+    __shared__ uint32_t wt_buf[(BLOCK_SIZE * BITS / 32) * BLOCK_SIZE];
     __half* wt_unpacked_buf = buf + BLOCK_SIZE;
 
     const __half ZERO = __float2half(0.0f);
@@ -308,7 +238,6 @@ __device__ void MMA_Int4_Half(
     const size_t warpSubIdx = warpIdx % 2;
     const size_t warpSuperIdx = warpIdx / 2;
     const size_t warpOffset = warpSubIdx * WARP_SIZE + threadIdx.x;
-
 
     // adjust for batch dim
     multiplier += blockIdx.z*seq_len*in_size;
@@ -323,14 +252,13 @@ __device__ void MMA_Int4_Half(
         }
     }
 
-
-    // TODO: bake in group quant fetches
-
-    for(size_t mtx_i = 0; mtx_i < mtx_in_size; mtx_i += BLOCK_SIZE/8) {
+    // TODO: reduce redundant group quant fetches
+    constexpr size_t step = BLOCK_SIZE * BITS / 32;
+    for(size_t mtx_i = 0; mtx_i < mtx_in_size; mtx_i += step) {
         __half scale = ZERO;
         __half zero = ZERO;
         {
-            const auto j_idx = (blockIdx.x*BLOCK_SIZE + warpOffset) + ((mtx_i*8)/group_size)*out_size;
+            const auto j_idx = (blockIdx.x*BLOCK_SIZE + warpOffset) + ((mtx_i*32/BITS)/group_size)*out_size;
             scale = scales[j_idx];
             zero = zeros[j_idx];
             #ifdef FMA_TRANSFORM
@@ -341,7 +269,7 @@ __device__ void MMA_Int4_Half(
         // GMEM loading chunk
 
         // grab the weights first since there's no bounds-checking to desync things
-        gmem_load_weights<is_sparse, BLOCK_SIZE>::load(
+        gmem_load_weights<is_sparse, BITS, BLOCK_SIZE>::load(
             matrix, wt_buf, sparse_mask,
             warpSuperIdx, warpOffset,
             mtx_i, blockIdx.x*BLOCK_SIZE,
@@ -349,17 +277,19 @@ __device__ void MMA_Int4_Half(
 
         gmem_load_multiplier(multiplier, buf,
                              warpIdx, threadIdx.x,
-                             blockIdx.y*BLOCK_SIZE, mtx_i*8,
+                             blockIdx.y*BLOCK_SIZE, mtx_i*32/BITS,
                              in_size, seq_len);
         __syncthreads();
 
         // everything is now in GMEM; all our operations now touch only SMEM
 
         // step 1: unpack packed weights from SMEM -> SMEM
-        smem_unpack_weights<is_sparse, BLOCK_SIZE, BUF_MTX_WIDTH, Quantization::DYNAMIC_EXPONENT_SYM>::load(
+        smem_unpack_weights<is_sparse, BLOCK_SIZE, BUF_MTX_WIDTH, BITS, Quantization::DYNAMIC_EXPONENT_SYM>::load(
             wt_buf, wt_unpacked_buf,
             warpSuperIdx, warpOffset,
             scale, zero);
+
+        __syncthreads();
 
         // step 2: actual matrix mult
         smem_block_matmul<is_sparse>(acc, buf, wt_unpacked_buf, warpIdx);
@@ -404,67 +334,46 @@ __device__ void MMA_Int4_Half(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-template <>
-__global__ void MMV_Int4_Dense<float>(
-    RECEIVE_BOILERPLATE_ARGS(float)
-) {
-    MMA_Int4_Float<false>(
-        outs, reinterpret_cast<const uint32_t*>(matrix), multiplier, scales, zeros,
-        group_size, in_size, seq_len, mtx_in_size, out_size, nullptr
-    );
-}
-template <>
-__global__ void MMV_Int4_Sparse<float>(
-    RECEIVE_BOILERPLATE_ARGS(float),
-    RECEIVE_SPARSE_MASK_ARGS
-) {
-    MMA_Int4_Float<true>(
-        outs, reinterpret_cast<const uint32_t*>(matrix), multiplier, scales, zeros,
-        group_size, in_size, seq_len, mtx_in_size, out_size, reinterpret_cast<const uint32_t*>(sparse_mask)
-    );
-}
+// torch dispatch requires definitions for fp32 and fp64; look at older commits
+// (0d20a43 or older) if you neeed fp32 for some reason; fp64 not supported
 
-template <>
-__global__ void MMV_Int4_Dense<c10::Half>(
-    RECEIVE_BOILERPLATE_ARGS(c10::Half)
-) {
-    MMA_Int4_Half<false>(
-        // torch stuff; torch doesn't store halfs internally as CUDA halfs,
-        // but they *are* bit-compatible so reinterpret_cast solves the issue
-        reinterpret_cast<__half*>(outs),
-        reinterpret_cast<const uint32_t*>(matrix),
-        reinterpret_cast<const __half*>(multiplier),
-        reinterpret_cast<const __half*>(scales),
-        reinterpret_cast<const __half*>(zeros),
-        group_size, in_size, seq_len, mtx_in_size, out_size, nullptr
-    );
-}
-template <>
-__global__ void MMV_Int4_Sparse<c10::Half>(
-    RECEIVE_BOILERPLATE_ARGS(c10::Half),
-    RECEIVE_SPARSE_MASK_ARGS
-) {
-    MMA_Int4_Half<true>(
-        reinterpret_cast<__half*>(outs),
-        reinterpret_cast<const uint32_t*>(matrix),
-        reinterpret_cast<const __half*>(multiplier),
-        reinterpret_cast<const __half*>(scales),
-        reinterpret_cast<const __half*>(zeros),
-        group_size, in_size, seq_len, mtx_in_size, out_size,
-        reinterpret_cast<const uint32_t*>(sparse_mask)
-    );
-}
+// as of writing, CUDA doesn't allow defining __global__ functions as member
+// methods (including static inlines) which means partial template spec isn't
+// available (AFAICT anyway); this obliges us to do the horrific act of
+// manually specifying every template full specialization then have compiletime
+// code switching downstream
+#define ARG_LST \
+    reinterpret_cast<__half*>(outs), \
+    reinterpret_cast<const uint32_t*>(matrix), \
+    reinterpret_cast<const __half*>(multiplier), \
+    reinterpret_cast<const __half*>(scales), \
+    reinterpret_cast<const __half*>(zeros), \
+    group_size, in_size, seq_len, mtx_in_size, out_size
+
+#define MACRO_OP(IS_SPARSE, BITS) \
+    template <typename scalar_t> \
+    __global__ void matmul_intermediate_ ## IS_SPARSE ## _ ## BITS( \
+        RECEIVE_BOILERPLATE_ARGS(scalar_t), RECEIVE_SPARSE_MASK_ARGS \
+    ) { assert(0); } \
+    template <> \
+    __global__ void matmul_intermediate_ ## IS_SPARSE ## _ ## BITS<c10::Half>( \
+        RECEIVE_BOILERPLATE_ARGS(c10::Half), RECEIVE_SPARSE_MASK_ARGS \
+    ) { \
+        if (IS_SPARSE) { \
+            MMA_Int4_Half<true, BITS>(ARG_LST, reinterpret_cast<const uint32_t*>(sparse_mask)); \
+        } else { \
+            MMA_Int4_Half<false, BITS>(ARG_LST, nullptr); \
+        } \
+    }
+
+#include "kernel_specs.cuh"
+
+#undef ARG_LST
+#undef MACRO_OP
 
 
-void matmul_int4(
-    torch::Tensor outs,
-    torch::Tensor matrix,
-    torch::Tensor x,
-    torch::Tensor scales,
-    torch::Tensor zeros,
-    int group_size,
-    c10::optional<torch::Tensor> sparse_mask
-) {
+template <uint32_t bits>
+void matmul_packed_int(TENSOR_MULT_ARGS) {
     const bool is_sparse = sparse_mask.has_value() && sparse_mask.value().defined();
 
     if (group_size < 0) {
@@ -485,17 +394,17 @@ void matmul_int4(
     // scales : [n_groups, out_size,]
     // zeros  : [n_groups, out_size,]
 
-    const auto batch_size = x.size(0);
-    const auto seq_len = x.size(1);
-    const auto in_size = x.size(2);
+    const auto batch_size = multiplier.size(0);
+    const auto seq_len = multiplier.size(1);
+    const auto in_size = multiplier.size(2);
 
     const auto mtx_in_size = matrix.size(0);
     const auto out_size = matrix.size(1);
 
     if (is_sparse) {
-        assert((mtx_in_size*16) == in_size);
+        assert((mtx_in_size * 32 * 2 / bits) == in_size);
     } else {
-        assert((mtx_in_size*8) == in_size);
+        assert((mtx_in_size * 32 / bits) == in_size);
     }
     assert(outs.size(0) == batch_size);
     assert(outs.size(1) == seq_len);
@@ -516,33 +425,39 @@ void matmul_int4(
         batch_size
     );
 
+    // TODO: toss exceptions for unsupported sparse/bit combinations
+
+    // let sparse pretend it's the same size as other things; only 4-bit
+    // supported for it currently anyway
+    const size_t pass_in_size = mtx_in_size * (is_sparse ? 2 : 1);
+    const int32_t* sparse_msk = is_sparse ? sparse_mask.value().data<int32_t>() : nullptr;
+
     if (is_sparse) {
         auto actual_sparse = sparse_mask.value();
         assert(actual_sparse.size(0)*2 == mtx_in_size);
         assert(actual_sparse.size(1) == out_size);
-
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.type(), "mmv_int4", ([&] {
-            MMV_Int4_Sparse<<<blocks, threads>>>(
-                outs.data<scalar_t>(),
-                matrix.data<int32_t>(),
-                x.data<scalar_t>(),
-                scales.data<scalar_t>(),
-                zeros.data<scalar_t>(),
-                // multiply mtx_in_size by 2 to pretend it's still in terms of
-                // weights; easier indexing
-                group_size, in_size, seq_len, mtx_in_size*2, out_size, actual_sparse.data<int32_t>()
-            );
-        }));
-    } else {
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.type(), "mmv_int4", ([&] {
-            MMV_Int4_Dense<<<blocks, threads>>>(
-                outs.data<scalar_t>(),
-                matrix.data<int32_t>(),
-                x.data<scalar_t>(),
-                scales.data<scalar_t>(),
-                zeros.data<scalar_t>(),
-                group_size, in_size, seq_len, mtx_in_size, out_size
-            );
-        }));
     }
+
+    // dispatch conditionally; see comments for intermediate defns for why this is
+    #define MACRO_OP(IS_SPARSE, BITS) \
+        if ((is_sparse == IS_SPARSE) && (bits == BITS)) { \
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(multiplier.type(), "mmv_int", ([&] { \
+            matmul_intermediate_ ## IS_SPARSE ## _ ## BITS<<<blocks, threads>>>( \
+                outs.data<scalar_t>(), \
+                matrix.data<int32_t>(), \
+                multiplier.data<scalar_t>(), \
+                scales.data<scalar_t>(), \
+                zeros.data<scalar_t>(), \
+                group_size, in_size, seq_len, pass_in_size, out_size, sparse_msk \
+            ); \
+        })); \
+        }
+
+    #include "kernel_specs.cuh"
+
+    #undef MACRO_OP
 }
+
+void matmul_int4(TENSOR_MULT_ARGS) { matmul_packed_int<4>(TENSOR_MULT_PASS); }
+void matmul_int3(TENSOR_MULT_ARGS) { matmul_packed_int<3>(TENSOR_MULT_PASS); }
+void matmul_int2(TENSOR_MULT_ARGS) { matmul_packed_int<2>(TENSOR_MULT_PASS); }

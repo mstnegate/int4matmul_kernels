@@ -3,62 +3,41 @@
 #include "matmul.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////
-// actual kernel stuff
-
-template <bool is_sparse>
-__device__ void MVA_Int4_Half( BOILERPLATE_ACCUM_ARGS(__half, float), SPARSE_MASK_ARGS );
-
-template <typename scalar_t>
-__global__ void MVV_Int4_Dense( RECEIVE_BOILERPLATE_ACCUM_ARGS(scalar_t, float) );
-
-template <typename scalar_t>
-__global__ void MVV_Int4_Sparse( RECEIVE_BOILERPLATE_ACCUM_ARGS(scalar_t, float), RECEIVE_SPARSE_MASK_ARGS );
-
-////////////////////////////////////////////////////////////////////////////////
-
-// invalid specializations
-template <typename scalar_t>
-__global__ void MVV_Int4_Dense(
-    RECEIVE_BOILERPLATE_ACCUM_ARGS(scalar_t, float)
-) { assert(0); }
-
-template <typename scalar_t>
-__global__ void MVV_Int4_Sparse(
-    RECEIVE_BOILERPLATE_ACCUM_ARGS(scalar_t, float),
-    RECEIVE_SPARSE_MASK_ARGS
-) { assert(0); }
-
-////////////////////////////////////////////////////////////////////////////////
 
 #define SMEM_DOT_ARGS \
     const __half mult, uint32_t* __restrict__ packed_wts, \
     const size_t i_offset, const size_t j_offset, \
     const __half scale, const __half zero
 
-template <bool is_sparse, Quantization qm>
+template <bool is_sparse, uint32_t BITS, Quantization qm>
 struct smem_dot_inner {
     __device__ inline static float calc(SMEM_DOT_ARGS);
 };
 
-template <Quantization qm>
-struct smem_dot_inner<false, qm> {
+template <uint32_t BITS, Quantization qm>
+struct smem_dot_inner<false, BITS, qm> {
     __device__ inline static float calc(SMEM_DOT_ARGS) {
+        static_assert(is_power_of_two(BITS), "Generic weight unpacking only supports powers of 2.");
+
         float m = 0.0f;
 
-        uint32_t* read_hd = packed_wts + j_offset + i_offset*4*BLOCK_SIZE;
+        constexpr size_t OUTER_STEP = 32 / BITS;
+
+        // N-bit packing => N 32-bit ints needed to hold 32 N-bit weights
+        uint32_t* read_hd = packed_wts + j_offset + i_offset*BITS*BLOCK_SIZE;
 
         #pragma unroll
-        for(int w = 0; w < 32; w += 8) {
+        for(int w = 0; w < 32; w += OUTER_STEP) {
             uint32_t v = *read_hd;
             #pragma unroll
-            for(int i = 0; i < 8; i += 4) {
-                // didn't see much gain by trying to pack 4x16 into a shuffle
+            for(int i = 0; i < OUTER_STEP; i += 4) {
+                // didn't see much gain by packing 4x16 into a shuffle
                 __half a = __shfl_sync(FULL_MASK, mult, w+i+0);
                 __half b = __shfl_sync(FULL_MASK, mult, w+i+1);
                 __half c = __shfl_sync(FULL_MASK, mult, w+i+2);
                 __half d = __shfl_sync(FULL_MASK, mult, w+i+3);
 
-                #define ACC_OP(X) m += __half2float(X)*__half2float(dequantize<qm>(v, scale, zero)); v >>= 4;
+                #define ACC_OP(X) m += __half2float(X)*__half2float(dequantize<qm, BITS>::call(v, scale, zero)); v >>= BITS;
                 ACC_OP(a)
                 ACC_OP(b)
                 ACC_OP(c)
@@ -72,7 +51,89 @@ struct smem_dot_inner<false, qm> {
 };
 
 template <Quantization qm>
-struct smem_dot_inner<true, qm> {
+struct smem_dot_inner<false, 3, qm> {
+    __device__ inline static float calc(SMEM_DOT_ARGS) {
+        if constexpr(BLOCK_SIZE != 64U) {
+            assert(0); // hardcoded assumption
+        }
+
+        float m = 0.0f;
+
+        uint32_t* read_hd = packed_wts + j_offset + i_offset*3*BLOCK_SIZE;
+
+        #define ACC_OP(X) m += __half2float(X)*__half2float(dequantize<qm, 3>::call(v, scale, zero)); v >>= 3;
+        #define FETCH_SEQ(j) \
+            __half a = __shfl_sync(FULL_MASK, mult, j+0); \
+            __half b = __shfl_sync(FULL_MASK, mult, j+1); \
+            __half c = __shfl_sync(FULL_MASK, mult, j+2); \
+            __half d = __shfl_sync(FULL_MASK, mult, j+3);
+
+        // manually unrolled kernels to deal with the edge values; not pretty
+        {
+            uint32_t v = *read_hd; read_hd += BLOCK_SIZE;
+            uint32_t v2 = *read_hd; read_hd += BLOCK_SIZE;
+            #pragma unroll
+            for(int i = 0; i < 8; i += 4) {
+                FETCH_SEQ(i);
+                ACC_OP(a)
+                ACC_OP(b)
+                ACC_OP(c)
+                ACC_OP(d)
+            }
+            {
+                FETCH_SEQ(8);
+                ACC_OP(a)
+                ACC_OP(b)
+                // weight 11: 2 bits from packed_wt #1, 1 bit from packed_wt #2
+                v |= ((v2 & 0x1) << 2);
+                ACC_OP(c)
+                // we're now in packed 2
+                v = v2 >> 1;
+                v2 = *read_hd;
+                ACC_OP(d)
+            }
+            #pragma unroll
+            for(int i = 12; i < 20; i += 4) {
+                FETCH_SEQ(i);
+                ACC_OP(a)
+                ACC_OP(b)
+                ACC_OP(c)
+                ACC_OP(d)
+            }
+            {
+                FETCH_SEQ(20);
+                ACC_OP(a)
+                // weight 21: 1 bit from packed_wt #2, 2 bits from packed_wt #3
+                v |= ((v2 & 0x3) << 1);
+                ACC_OP(b)
+                v = v2 >> 2;
+                ACC_OP(c)
+                ACC_OP(d)
+            }
+            #pragma unroll
+            for(int i = 24; i < 32; i += 4) {
+                FETCH_SEQ(i);
+                ACC_OP(a)
+                ACC_OP(b)
+                ACC_OP(c)
+                ACC_OP(d)
+            }
+        }
+        #undef FETCH_SEQ
+        #undef ACC_OP
+
+        return m;
+    }
+};
+
+template <uint32_t BITS, Quantization qm>
+struct smem_dot_inner<true, BITS, qm> {
+    // general case not supported
+    __device__ inline static float calc(SMEM_DOT_ARGS) { assert(0); }
+};
+
+template <Quantization qm>
+struct smem_dot_inner<true, 4, qm> {
     __device__ inline static float calc(SMEM_DOT_ARGS) {
         const size_t MASK_ROWS = (BLOCK_SIZE / 8 / 4);
 
@@ -93,7 +154,7 @@ struct smem_dot_inner<true, qm> {
             __half d = __shfl_sync(FULL_MASK, mult, i+3);
 
             // heavy branching's fine since it's all in register
-            #define ACC_OP(X) if (msk & 1) { m += __half2float(X)*__half2float(dequantize<qm>((uint32_t)(v & 0xF), scale, zero)); v >>= 4; } msk >>= 1;
+            #define ACC_OP(X) if (msk & 1) { m += __half2float(X)*__half2float(dequantize<qm, 4>::call((uint32_t)(v & 0xF), scale, zero)); v >>= 4; } msk >>= 1;
             ACC_OP(a)
             ACC_OP(b)
             ACC_OP(c)
@@ -108,21 +169,21 @@ struct smem_dot_inner<true, qm> {
 };
 
 
-template <bool is_sparse, Quantization qm>
+template <bool is_sparse, uint32_t BITS, Quantization qm>
 struct smem_dot {
     __device__ inline static float calc(SMEM_DOT_ARGS) {
-        return smem_dot_inner<is_sparse, qm>::calc(mult, packed_wts, i_offset, j_offset, scale, zero);
+        return smem_dot_inner<is_sparse, BITS, qm>::calc(mult, packed_wts, i_offset, j_offset, scale, zero);
     }
 };
-template <bool is_sparse>
-struct smem_dot<is_sparse, Quantization::DYNAMIC_EXPONENT_SYM> {
+template <bool is_sparse, uint32_t BITS>
+struct smem_dot<is_sparse, BITS, Quantization::DYNAMIC_EXPONENT_SYM> {
     __device__ inline static float calc(SMEM_DOT_ARGS) {
         // WARNING: this assumes that the entire warp branches the same way!
         if (__hge(scale, __float2half(0.0f))) {
-            return smem_dot_inner<is_sparse, Quantization::LINEAR>::calc(
+            return smem_dot_inner<is_sparse, BITS, Quantization::LINEAR>::calc(
                 mult, packed_wts, i_offset, j_offset, scale, zero);
         } else {
-            return smem_dot_inner<is_sparse, Quantization::EXPONENT_SYM>::calc(
+            return smem_dot_inner<is_sparse, BITS, Quantization::EXPONENT_SYM>::calc(
                 mult, packed_wts, i_offset, j_offset, __hneg(scale), zero);
         }
     }
@@ -134,7 +195,7 @@ struct smem_dot<is_sparse, Quantization::DYNAMIC_EXPONENT_SYM> {
 #define BLOCK_WIDTH_SPAN 4
 
 // generic half-precision matrix-vector mult
-template <bool is_sparse>
+template <bool is_sparse, uint32_t BITS>
 __device__ void MVA_Int4_Half(
     BOILERPLATE_ACCUM_ARGS(__half, float),
     SPARSE_MASK_ARGS
@@ -184,16 +245,16 @@ __device__ void MVA_Int4_Half(
         #endif
 
         // GMEM loading chunk
-        gmem_load_weights<is_sparse, BLOCK_SIZE>::load(
+        gmem_load_weights<is_sparse, BITS, BLOCK_SIZE>::load(
             matrix, packed_wts, sparse_mask,
             warpSuperIdx, warpOffset,
-            downPos/8, mtx_j,
+            downPos*BITS/32, mtx_j,
             out_size);
 
         __syncthreads();
 
         // fused unpack and add
-        float acc = smem_dot<is_sparse, Quantization::DYNAMIC_EXPONENT_SYM>::calc(
+        float acc = smem_dot<is_sparse, BITS, Quantization::DYNAMIC_EXPONENT_SYM>::calc(
             m, packed_wts, warpSuperIdx, warpOffset, scale, zero);
 
         __syncthreads();
@@ -208,61 +269,38 @@ __device__ void MVA_Int4_Half(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-template <>
-__global__ void MVV_Int4_Dense<float>(
-    RECEIVE_BOILERPLATE_ARGS(float)
-) {
-    assert(0);
-}
-template <>
-__global__ void MVV_Int4_Sparse<float>(
-    RECEIVE_BOILERPLATE_ARGS(float),
-    RECEIVE_SPARSE_MASK_ARGS
-) {
-    assert(0);
-}
+// see matmul_kernel.cu for an explanation of why we're doing this
+#define ARG_LST \
+    outs, \
+    reinterpret_cast<const uint32_t*>(matrix), \
+    reinterpret_cast<const __half*>(multiplier), \
+    reinterpret_cast<const __half*>(scales), \
+    reinterpret_cast<const __half*>(zeros), \
+    group_size, in_size, seq_len, mtx_in_size, out_size
 
-template <>
-__global__ void MVV_Int4_Dense<c10::Half>(
-    RECEIVE_BOILERPLATE_ACCUM_ARGS(c10::Half, float)
-) {
-    MVA_Int4_Half<false>(
-        // torch stuff; torch doesn't store halfs internally as CUDA halfs,
-        // but they *are* bit-compatible so reinterpret_cast solves the issue
-        outs,
-        reinterpret_cast<const uint32_t*>(matrix),
-        reinterpret_cast<const __half*>(multiplier),
-        reinterpret_cast<const __half*>(scales),
-        reinterpret_cast<const __half*>(zeros),
-        group_size, in_size, seq_len, mtx_in_size, out_size, nullptr
-    );
-}
-template <>
-__global__ void MVV_Int4_Sparse<c10::Half>(
-    RECEIVE_BOILERPLATE_ACCUM_ARGS(c10::Half, float),
-    RECEIVE_SPARSE_MASK_ARGS
-) {
-    MVA_Int4_Half<true>(
-        outs,
-        reinterpret_cast<const uint32_t*>(matrix),
-        reinterpret_cast<const __half*>(multiplier),
-        reinterpret_cast<const __half*>(scales),
-        reinterpret_cast<const __half*>(zeros),
-        group_size, in_size, seq_len, mtx_in_size, out_size,
-        reinterpret_cast<const uint32_t*>(sparse_mask)
-    );
-}
+#define MACRO_OP(IS_SPARSE, BITS) \
+    template <typename scalar_t> \
+    __global__ void matvec_intermediate_ ## IS_SPARSE ## _ ## BITS( \
+        RECEIVE_BOILERPLATE_ACCUM_ARGS(scalar_t, float), RECEIVE_SPARSE_MASK_ARGS \
+    ) { assert(0); } \
+    template <> \
+    __global__ void matvec_intermediate_ ## IS_SPARSE ## _ ## BITS<c10::Half>( \
+        RECEIVE_BOILERPLATE_ACCUM_ARGS(c10::Half, float), RECEIVE_SPARSE_MASK_ARGS \
+    ) { \
+        if (IS_SPARSE) { \
+            MVA_Int4_Half<true, BITS>(ARG_LST, reinterpret_cast<const uint32_t*>(sparse_mask)); \
+        } else { \
+            MVA_Int4_Half<false, BITS>(ARG_LST, nullptr); \
+        } \
+    }
 
+#include "kernel_specs.cuh"
 
-void matvec_int4(
-    torch::Tensor outs,
-    torch::Tensor matrix,
-    torch::Tensor x,
-    torch::Tensor scales,
-    torch::Tensor zeros,
-    int group_size,
-    c10::optional<torch::Tensor> sparse_mask
-) {
+#undef ARG_LST
+#undef MACRO_OP
+
+template <uint32_t bits>
+void matvec_packed_int(TENSOR_MULT_ARGS) {
     // TODO: proper dimensioning later
     const bool is_sparse = sparse_mask.has_value() && sparse_mask.value().defined();
 
@@ -275,9 +313,9 @@ void matvec_int4(
     // special case of matrix multiplication: with seq-len 1 tensors; see the
     // matmul kernel for explanations on dimensions and such
 
-    const auto batch_size = x.size(0);
-    const auto seq_len = x.size(1);
-    const auto in_size = x.size(2);
+    const auto batch_size = multiplier.size(0);
+    const auto seq_len = multiplier.size(1);
+    const auto in_size = multiplier.size(2);
 
     const auto mtx_in_size = matrix.size(0);
     const auto out_size = matrix.size(1);
@@ -285,10 +323,11 @@ void matvec_int4(
     assert(seq_len == 1);
 
     if (is_sparse) {
-        assert((mtx_in_size*16) == in_size);
+        assert((mtx_in_size * 32 * 2 / bits) == in_size);
     } else {
-        assert((mtx_in_size*8) == in_size);
+        assert((mtx_in_size * 32 / bits) == in_size);
     }
+
     assert(outs.size(0) == batch_size);
     assert(outs.size(1) == seq_len);
     assert(outs.size(2) == out_size);
@@ -311,36 +350,38 @@ void matvec_int4(
     // memory overhead; should fix that at some point
     auto temp_outs = outs.to(torch::kFloat32);
 
+    const size_t pass_in_size = mtx_in_size * (is_sparse ? 2 : 1);
+    const int32_t* sparse_msk = is_sparse ? sparse_mask.value().data<int32_t>() : nullptr;
+
     if (is_sparse) {
         auto actual_sparse = sparse_mask.value();
         assert(actual_sparse.size(0)*2 == mtx_in_size);
         assert(actual_sparse.size(1) == out_size);
-
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.type(), "mmv_int4", ([&] {
-            MVV_Int4_Sparse<<<blocks, threads>>>(
-                temp_outs.data<float>(),
-                matrix.data<int32_t>(),
-                x.data<scalar_t>(),
-                scales.data<scalar_t>(),
-                zeros.data<scalar_t>(),
-                // multiply mtx_in_size by 2 to pretend it's still in terms of
-                // weights; easier indexing
-                group_size, in_size, seq_len, mtx_in_size*2, out_size, actual_sparse.data<int32_t>()
-            );
-        }));
-    } else {
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.type(), "mmv_int4", ([&] {
-            MVV_Int4_Dense<<<blocks, threads>>>(
-                temp_outs.data<float>(),
-                matrix.data<int32_t>(),
-                x.data<scalar_t>(),
-                scales.data<scalar_t>(),
-                zeros.data<scalar_t>(),
-                group_size, in_size, seq_len, mtx_in_size, out_size
-            );
-        }));
     }
+
+    // dispatch conditionally; see comments for intermediate defns for why this is
+    #define MACRO_OP(IS_SPARSE, BITS) \
+        if ((is_sparse == IS_SPARSE) && (bits == BITS)) { \
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(multiplier.type(), "mvec_int", ([&] { \
+            matvec_intermediate_ ## IS_SPARSE ## _ ## BITS<<<blocks, threads>>>( \
+                temp_outs.data<float>(), \
+                matrix.data<int32_t>(), \
+                multiplier.data<scalar_t>(), \
+                scales.data<scalar_t>(), \
+                zeros.data<scalar_t>(), \
+                group_size, in_size, seq_len, pass_in_size, out_size, sparse_msk \
+            ); \
+        })); \
+        }
+
+    #include "kernel_specs.cuh"
+
+    #undef MACRO_OP
+
     temp_outs = temp_outs.to(torch::kHalf);
     outs.index_put_({"..."}, temp_outs);
-
 }
+
+void matvec_int4(TENSOR_MULT_ARGS) { matvec_packed_int<4>(TENSOR_MULT_PASS); }
+void matvec_int3(TENSOR_MULT_ARGS) { matvec_packed_int<3>(TENSOR_MULT_PASS); }
+void matvec_int2(TENSOR_MULT_ARGS) { matvec_packed_int<2>(TENSOR_MULT_PASS); }

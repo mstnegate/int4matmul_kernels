@@ -1,0 +1,6 @@
+MACRO_OP(false, 4)
+MACRO_OP(false, 3)
+MACRO_OP(false, 2)
+MACRO_OP(true, 4)
+MACRO_OP(true, 3)
+MACRO_OP(true, 2)

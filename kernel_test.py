@@ -1,10 +1,27 @@
 import torch
-import int4matmul
 import numpy as np
+
 import time
+
+import int4matmul
 
 ################################################################################
 
+# stuff to be tested
+TEST_MATRIX_KERNELS = True
+TEST_VECTOR_KERNELS = True
+TEST_SPARSE_KERNELS = True
+MTX_DIMENSIONS = [
+    # batch size, mtx size, hidden dim
+    (1, 128, 128),
+    (1, 1024, 1024),
+    (1, 16384, 16384),
+    (1, 5120, 5120),
+    (1, 20480, 5120),
+    (1, 5120, 20480),
+]
+
+QUANTIZATION_BITS = 4
 # sparsity structure; this is # of total weights (non-zero weights is half that)
 SPARSE_BLOCK_SIZE = 32
 GROUP_QUANTIZATION_SIZE = 128
@@ -36,9 +53,78 @@ RANDOMIZE_SPARSE_MASK = True
 
 ################################################################################
 
+INT_N_LABEL = "int%d" % QUANTIZATION_BITS
+
 # TODO: enable testing of dynamic exponent
 
+def _pack_dense_weights_pow2(bits, weights):
+    weights = weights.T.contiguous()
+
+    weights_per_int = 32 // bits
+
+    wt_out = torch.zeros(
+        (weights.shape[0] // weights_per_int, weights.shape[1]),
+        dtype=torch.int,
+        device=weights.device
+    )
+
+    for i in range(0, weights.shape[0], weights_per_int):
+        write_idx = i // weights_per_int
+
+        v = weights[i, :].clone()
+        for j in range(bits, 32, bits):
+            v |= weights[i+(j // bits), :] << j
+
+        wt_out.data[write_idx, :] = v
+
+    return wt_out
+
+def _pack_dense_weights_3(weights):
+    assert(weights.shape[0] % 64 == 0)
+
+    weights = weights.T.contiguous()
+
+    wt_out = torch.zeros(
+        ((weights.shape[0] * 3) // 32, weights.shape[1]),
+        dtype=torch.int,
+        device=weights.device
+    )
+
+    for i in range(0, weights.shape[0], 32):
+        write_idx = (i * 3) // 32
+
+        acc = []
+        j = i
+        bits_to_write = 32*3
+        bits_left = 0
+
+        while bits_to_write > 0:
+            active = weights[j, :]
+            bits_read = 3
+
+            while bits_read > 0:
+                if bits_left <= 0:
+                    acc.append(torch.zeros_like(weights[j, :]))
+                    bits_left = 32
+
+                bits_to_read = min(bits_read, bits_left, bits_to_write)
+
+                acc[-1] |= (active & ((1 << bits_to_read) - 1)) << (32 - bits_left)
+                active >>= bits_to_read
+                bits_read -= bits_to_read
+                bits_to_write -= bits_to_read
+                bits_left -= bits_to_read
+
+            j += 1
+
+        for j, buf in enumerate(acc):
+            wt_out.data[write_idx+j, :] = buf
+
+    return wt_out
+
 def _pack_sparse_matrices(hidden_dim, mtx_size, weights, sparse_mask):
+    assert (QUANTIZATION_BITS == 4)
+
     f_Wq = torch.empty((mtx_size//16, hidden_dim), dtype=torch.int, device="cuda:0")
     f_sparse_q = torch.empty((mtx_size//32, hidden_dim), dtype=torch.int, device="cuda:0")
     int4matmul.weight_matrix_packing(
@@ -86,7 +172,7 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
             4. optionally: an int32 packed matrix containing the sparse mask
     """
 
-    b_Wq = torch.randint(0, 16, (hidden_dim, mtx_size), dtype=torch.int, device="cuda:0")
+    b_Wq = torch.randint(0, (1 << QUANTIZATION_BITS), (hidden_dim, mtx_size), dtype=torch.int, device="cuda:0")
 
     if GROUP_QUANTIZATION_SIZE in (-1, None):
         n_groups = 1
@@ -95,7 +181,7 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
         n_groups = int(np.ceil(mtx_size / GROUP_QUANTIZATION_SIZE))
         shape = (n_groups, hidden_dim,)
 
-    zeros = torch.randint(0, 16, shape, dtype=torch.int, device="cuda:0").to(torch.float16)
+    zeros = torch.randint(0, (1 << QUANTIZATION_BITS), shape, dtype=torch.int, device="cuda:0").to(torch.float16)
     scales = ((torch.rand(shape, dtype=dtype, device="cuda:0") * 1.0) + 0.01)
 
     if not RANDOMIZE_WEIGHTS:
@@ -144,22 +230,10 @@ def generate_weights_matrix(hidden_dim, mtx_size, sparse=False, dtype=torch.floa
         W *= sparse_mask.to(dtype)
         hiW *= sparse_mask.to(torch.float32)
     else:
-        b_Wq = b_Wq.T
-
-        Wq = torch.empty((mtx_size//8, hidden_dim), dtype=torch.int, device="cuda:0")
-
-        for i in range(0, b_Wq.shape[0], 8):
-            write_idx = i // 8
-
-            v = b_Wq[i, :].clone()
-            v |= b_Wq[i+1, :] << 4
-            v |= b_Wq[i+2, :] << 8
-            v |= b_Wq[i+3, :] << 12
-            v |= b_Wq[i+4, :] << 16
-            v |= b_Wq[i+5, :] << 20
-            v |= b_Wq[i+6, :] << 24
-            v |= b_Wq[i+7, :] << 28
-            Wq[write_idx, :] = v
+        if QUANTIZATION_BITS == 3:
+            Wq = _pack_dense_weights_3(b_Wq)
+        else:
+            Wq = _pack_dense_weights_pow2(QUANTIZATION_BITS, b_Wq)
 
     return W, hiW, (Wq, zeros, scales, sparse_q)
 
@@ -177,10 +251,10 @@ def fp16_fp16_matmul(W, x):
 def fp32_fp32_matmul(W, x):
     return x.to(torch.float32) @ W
 
-def fp16_int4_matmul(Wq, x, scales, zeros, sparse_q):
+def fp16_intn_matmul(Wq, x, scales, zeros, sparse_q):
     outs = torch.zeros((x.shape[0], x.shape[1], Wq.shape[1]), dtype=FLOAT_T, device="cuda:0")
-    int4matmul.quant_int4_linear_mult(
-        outs, Wq, x, scales, zeros, GROUP_QUANTIZATION_SIZE, sparse_q
+    int4matmul.quant_matmul(
+        QUANTIZATION_BITS, outs, Wq, x, scales, zeros, GROUP_QUANTIZATION_SIZE, sparse_q
     )
     return outs
 
@@ -200,17 +274,17 @@ def run_test_case(batch_size, mtx_size, hidden_dim, seq_len, sparse, dtype, n_re
 
     mm_ff = fp16_fp16_matmul(W, x)
     mm_ff_32 = fp32_fp32_matmul(hiW, x)
-    mm_if = fp16_int4_matmul(Wq, x, scales, zeros, sparse_q)
+    mm_if = fp16_intn_matmul(Wq, x, scales, zeros, sparse_q)
 
     error["fp16,fp16"] = abs_error(mm_ff_32, mm_ff)
-    error["int4,fp16"] = abs_error(mm_ff_32, mm_if)
+    error["%s,fp16" % INT_N_LABEL] = abs_error(mm_ff_32, mm_if)
 
     if (PRINT_KERNEL_OUTPUTS):
         print(mm_ff)
         print(mm_if)
         print(error)
 
-    if BREAK_ON_ERROR and (error["int4,fp16"] > 0.1):
+    if BREAK_ON_ERROR and (error["%s,fp16" % INT_N_LABEL] > 0.1):
         import pdb; pdb.set_trace()
 
     N_TRIALS = 5
@@ -220,7 +294,7 @@ def run_test_case(batch_size, mtx_size, hidden_dim, seq_len, sparse, dtype, n_re
 
     for name, func in [
         ("fp16,fp16", lambda: fp16_fp16_matmul(W, x)),
-        ("int4,fp16", lambda: fp16_int4_matmul(Wq, x, scales, zeros, sparse_q)),
+        ("%s,fp16" % INT_N_LABEL, lambda: fp16_intn_matmul(Wq, x, scales, zeros, sparse_q)),
     ]:
         times = []
         for _ in range(N_TRIALS):
@@ -239,26 +313,16 @@ def run_test_case(batch_size, mtx_size, hidden_dim, seq_len, sparse, dtype, n_re
 ################################################################################
 
 if __name__ == "__main__":
-    TRIALS = [
-        # batch size, mtx size, hidden dim, seq len, sparse
-        (1, 128, 128, 2048, False),
-        (1, 128, 128, 2048, True),
-        (1, 1024, 1024, 2048, False),
-        (1, 1024, 1024, 2048, True),
-        (1, 20480, 5120, 2048, False),
-        (1, 20480, 5120, 2048, True),
-        (1, 5120, 20480, 2048, False),
-        (1, 5120, 20480, 2048, True),
-        (1, 1024, 1024, 1, False),
-        (1, 5120, 5120, 1, False),
-        (1, 16384, 16384, 1, False),
-        (1, 20480, 5120, 1, False),
-        (1, 5120, 20480, 1, False),
-        (1, 5120, 5120, 1, True),
-        (1, 5120, 20480, 1, True),
-        (1, 16384, 16384, 1, True),
-        (1, 20480, 5120, 1, True),
-    ]
+    TRIALS = []
+
+    if TEST_MATRIX_KERNELS:
+        TRIALS.extend([(*x, 2048, False) for x in MTX_DIMENSIONS])
+    if TEST_MATRIX_KERNELS and TEST_SPARSE_KERNELS:
+        TRIALS.extend([(*x, 2048, True) for x in MTX_DIMENSIONS])
+    if TEST_VECTOR_KERNELS:
+        TRIALS.extend([(*x, 1, False) for x in MTX_DIMENSIONS])
+    if TEST_VECTOR_KERNELS and TEST_SPARSE_KERNELS:
+        TRIALS.extend([(*x, 1, True) for x in MTX_DIMENSIONS])
 
     runtime_table = []
 
@@ -275,13 +339,13 @@ if __name__ == "__main__":
         # we define a serious error as:
         # 1. either BOTH cases have finite error (inf pops up if fp32 precision
         #    gives a 0 in the output), AND error exceeds 10%
-        # 2. OR: int4-fp16 does not have finite error but fp16 does
+        # 2. OR: intn-fp16 does not have finite error but fp16 does
         # (if fp16 has non-finite error, we don't care)
         is_probably_serious = (
             torch.isfinite(error["fp16,fp16"])
-            and torch.isfinite(error["int4,fp16"])
+            and torch.isfinite(error["%s,fp16" % INT_N_LABEL])
             and max_error > 0.1
-        ) or (torch.isfinite(error["fp16,fp16"]) and not torch.isfinite(error["int4,fp16"]))
+        ) or (torch.isfinite(error["fp16,fp16"]) and not torch.isfinite(error["%s,fp16" % INT_N_LABEL]))
 
         if is_probably_serious:
             if not I_LIVE_LIFE_ON_THE_EDGE:

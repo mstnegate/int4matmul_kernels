@@ -1,8 +1,11 @@
-This repository contains CUDA kernels for [quantized] int4-fp16 matrix multiplication. They were written for [reduced-kobold](https://github.com/mstnegate/reduced-kobold/), but should be usable for anything which packs data in the same way.
+This repository contains CUDA kernels for [quantized] int-fp16 matrix multiplication. They were written for [reduced-kobold](https://github.com/mstnegate/reduced-kobold/), but should be usable for anything which packs data in the same way.
 
 The kernels are lightly optimized; see microbenchmarks below. TL;DR: matmul is ~1.3x slower for dense, ~2.2x slower for sparse; matvec is ~3x faster for dense, ~2x for sparse (at least for me.)
 
-Currently the kernels support quantized int4-fp16 multiplication with optional 16:32 structured sparsity. Group quantization is supported for multiples of 64. All dimensions (except sequence length) must be a multiple of 64 currently. This was true for every model I've tested, but feel free to open an issue if you have some legitimate use case where this isn't true.
+Supported configurations:
+* [quantized] int4-fp16 multiplication, with optional 16:32 structured sparsity
+* [quantized] int3-fp16 and int2-fp16 multiplication; sparsity not supported (currently experimental)
+Group quantization is supported for multiples of 64. All [unpacked] dimensions (except sequence length) must be a multiple of 64 currently. This was true for every model I've tested, but feel free to open an issue if you have some legitimate use case where this isn't true.
 
 Note that due to use of tensor cores, the code requires compute capability 7.X or greater. Theoretically any card from Volta onwards *should* work, but I've only tested with a RTX 3080.
 
